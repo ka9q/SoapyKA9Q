@@ -371,6 +371,9 @@ public:
     SoapySDR::Kwargs getHardwareInfo() const override;
     size_t getNumChannels(int direction) const override { return direction == SOAPY_SDR_RX ? 1 : 0; }
     bool getFullDuplex(int, size_t) const override { return false; }
+    std::vector<std::string> listAntennas(int direction, size_t channel) const override;
+    void setAntenna(int direction, size_t channel, const std::string &name) override;
+    std::string getAntenna(int direction, size_t channel) const override;
     std::vector<std::string> getStreamFormats(int, size_t) const override { return {SOAPY_SDR_CF32}; }
     std::string getNativeStreamFormat(int, size_t, double &fullScale) const override {
         fullScale = 1.0; return SOAPY_SDR_CF32;
@@ -385,13 +388,20 @@ public:
 
     void setFrequency(int direction, size_t channel, double frequency,
                       const SoapySDR::Kwargs &) override;
+    void setFrequency(int direction, size_t channel, const std::string &name,
+                      double frequency, const SoapySDR::Kwargs &) override;
     double getFrequency(int, size_t) const override { return frequency_; }
+    double getFrequency(int direction, size_t channel,
+                        const std::string &name) const override;
     std::vector<std::string> listFrequencies(int, size_t) const override { return {"RF"}; }
     SoapySDR::RangeList getFrequencyRange(int, size_t) const override {
         return {SoapySDR::Range(0, 6e9)};
     }
+    SoapySDR::RangeList getFrequencyRange(int direction, size_t channel,
+        const std::string &name) const override;
     void setSampleRate(int direction, size_t channel, double rate) override;
     double getSampleRate(int, size_t) const override { return sampleRate_; }
+    std::vector<double> listSampleRates(int direction, size_t channel) const override;
     SoapySDR::RangeList getSampleRateRange(int, size_t) const override {
         return {SoapySDR::Range(8000, 1000000)};
     }
@@ -459,6 +469,26 @@ void SoapyKA9Q::requireRx(int direction, size_t channel) const
 {
     if (direction != SOAPY_SDR_RX || channel != 0)
         throw std::runtime_error("SoapyKA9Q supports RX channel 0 only");
+}
+
+std::vector<std::string> SoapyKA9Q::listAntennas(int direction, size_t channel) const
+{
+    requireRx(direction, channel);
+    return {"RX"};
+}
+
+void SoapyKA9Q::setAntenna(int direction, size_t channel, const std::string &name)
+{
+    requireRx(direction, channel);
+    // CubicSDR may apply an empty saved antenna name even for a one-antenna device.
+    if (!name.empty() && name != "RX")
+        throw std::runtime_error("Unknown antenna: " + name);
+}
+
+std::string SoapyKA9Q::getAntenna(int direction, size_t channel) const
+{
+    requireRx(direction, channel);
+    return "RX";
 }
 
 Status SoapyKA9Q::configure(bool destroy)
@@ -689,6 +719,32 @@ void SoapyKA9Q::setFrequency(int direction, size_t channel, double frequency,
     if (stream_ != nullptr) configure();
 }
 
+void SoapyKA9Q::setFrequency(int direction, size_t channel,
+                             const std::string &name, double frequency,
+                             const SoapySDR::Kwargs &args)
+{
+    if (name != "RF")
+        throw std::runtime_error("Unknown frequency component: " + name);
+    setFrequency(direction, channel, frequency, args);
+}
+
+double SoapyKA9Q::getFrequency(int direction, size_t channel,
+                               const std::string &name) const
+{
+    requireRx(direction, channel);
+    if (name != "RF")
+        throw std::runtime_error("Unknown frequency component: " + name);
+    return frequency_;
+}
+
+SoapySDR::RangeList SoapyKA9Q::getFrequencyRange(
+    int direction, size_t channel, const std::string &name) const
+{
+    requireRx(direction, channel);
+    if (name != "RF") return {};
+    return {SoapySDR::Range(0, 6e9)};
+}
+
 void SoapyKA9Q::setSampleRate(int direction, size_t channel, double rate)
 {
     requireRx(direction, channel);
@@ -696,6 +752,13 @@ void SoapyKA9Q::setSampleRate(int direction, size_t channel, double rate)
     sampleRate_ = rate;
     if (bandwidth_ > rate) bandwidth_ = rate;
     if (stream_ != nullptr) configure();
+}
+
+std::vector<double> SoapyKA9Q::listSampleRates(int direction, size_t channel) const
+{
+    requireRx(direction, channel);
+    return {8000, 12000, 16000, 24000, 32000, 48000,
+            96000, 192000, 384000, 768000, 1000000};
 }
 
 void SoapyKA9Q::setBandwidth(int direction, size_t channel, double bw)

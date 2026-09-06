@@ -16,7 +16,10 @@ SOAPY_SDR_MODULE_UTIL(
 
 if(APPLE)
     target_compile_definitions(ka9qSupport PRIVATE _DARWIN_C_SOURCE)
+    set_target_properties(ka9qSupport PROPERTIES
+        BUILD_RPATH "/usr/local/lib"
+        INSTALL_RPATH "@executable_path/../Frameworks;/usr/local/lib"
+    )
 else()
     target_compile_definitions(ka9qSupport PRIVATE _DEFAULT_SOURCE)
 endif()
-
