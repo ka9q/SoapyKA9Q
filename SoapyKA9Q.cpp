@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -28,6 +29,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -36,6 +38,10 @@ constexpr uint16_t KA9Q_STATUS_PORT = 5006;
 constexpr uint8_t KA9Q_STATUS = 0;
 constexpr uint8_t KA9Q_COMMAND = 1;
 constexpr uint8_t RTP_VERSION = 2;
+// radiod measures channel lifetime in processing frames (nominally 50/s).
+constexpr unsigned STREAM_LIFETIME_FRAMES = 500; // About 10 seconds.
+constexpr unsigned PROBE_LIFETIME_FRAMES = 100;  // About 2 seconds.
+constexpr auto KEEPALIVE_INTERVAL = std::chrono::seconds(3);
 
 static double fullNyquistBandwidth(double sampleRate)
 {
@@ -439,7 +445,12 @@ public:
     }
 
 private:
-    Status configure(bool destroy = false);
+    Status configure(bool destroy = false,
+                     unsigned lifetimeFrames = STREAM_LIFETIME_FRAMES);
+    void sendKeepalive();
+    void startKeepalive();
+    void stopKeepalive();
+    void keepaliveLoop();
     int receivePacket(KA9QStream &stream, long timeoutUs);
     void requireRx(int direction, size_t channel) const;
 
@@ -458,6 +469,11 @@ private:
     KA9QStream *stream_ = nullptr;
     bool ownsChannel_ = false;
     mutable std::mutex mutex_;
+    std::mutex commandMutex_;
+    std::mutex keepaliveMutex_;
+    std::condition_variable keepaliveCondition_;
+    bool keepaliveStop_ = true;
+    std::thread keepaliveThread_;
 };
 
 SoapyKA9Q::SoapyKA9Q(const SoapySDR::Kwargs &args)
@@ -490,7 +506,7 @@ SoapyKA9Q::SoapyKA9Q(const SoapySDR::Kwargs &args)
     // A short-lived idle channel obtains the current front-end tuning limits
     // without asking radiod to move the shared tuner or emit sample data.
     // This capability probe is deliberately separate from stream lifetime.
-    configure();
+    configure(false, PROBE_LIFETIME_FRAMES);
     ownsChannel_ = true;
     configure(true);
     ownsChannel_ = false;
@@ -542,13 +558,14 @@ std::string SoapyKA9Q::getAntenna(int direction, size_t channel) const
     return "RX";
 }
 
-Status SoapyKA9Q::configure(bool destroy)
+Status SoapyKA9Q::configure(bool destroy, unsigned lifetimeFrames)
 {
+    std::lock_guard<std::mutex> commandLock(commandMutex_);
     const uint32_t tag = randomSsrc();
     std::vector<uint8_t> command{KA9Q_COMMAND};
     putUnsigned(command, COMMAND_TAG, tag);
     putUnsigned(command, OUTPUT_SSRC, ssrc_);
-    putUnsigned(command, LIFETIME, destroy ? 1 : 0);
+    putUnsigned(command, LIFETIME, destroy ? 1 : lifetimeFrames);
     if (!destroy) {
         putDouble(command, RADIO_FREQUENCY, frequency_);
         // radiod validates sample rate against the channel's current
@@ -616,6 +633,61 @@ Status SoapyKA9Q::configure(bool destroy)
     throw std::runtime_error("timed out waiting for radiod status response");
 }
 
+void SoapyKA9Q::sendKeepalive()
+{
+    // Any command naming the channel restarts radiod's lifetime counter.
+    // No tag is needed because a keepalive acknowledgement is not useful.
+    std::vector<uint8_t> command{KA9Q_COMMAND};
+    putUnsigned(command, OUTPUT_SSRC, ssrc_);
+    command.push_back(EOL);
+
+    std::lock_guard<std::mutex> commandLock(commandMutex_);
+    const ssize_t sent = ::sendto(commandSocket_.fd, command.data(), command.size(), 0,
+        reinterpret_cast<const sockaddr *>(&control_.addr), sizeof(control_.addr));
+    if (sent != ssize_t(command.size())) {
+        const int error = errno;
+        throw std::runtime_error("radiod keepalive send to " + endpointText(control_) +
+            " via " + (iface_.empty() ? std::string("default route") : iface_) +
+            " failed: " + std::string(strerror(error)));
+    }
+}
+
+void SoapyKA9Q::keepaliveLoop()
+{
+    std::unique_lock<std::mutex> lock(keepaliveMutex_);
+    while (!keepaliveCondition_.wait_for(lock, KEEPALIVE_INTERVAL,
+                                         [this] { return keepaliveStop_; })) {
+        lock.unlock();
+        try {
+            sendKeepalive();
+        } catch (const std::exception &error) {
+            SoapySDR::logf(SOAPY_SDR_WARNING,
+                "KA9Q channel keepalive failed: %s", error.what());
+        }
+        lock.lock();
+    }
+}
+
+void SoapyKA9Q::startKeepalive()
+{
+    stopKeepalive();
+    {
+        std::lock_guard<std::mutex> lock(keepaliveMutex_);
+        keepaliveStop_ = false;
+    }
+    keepaliveThread_ = std::thread(&SoapyKA9Q::keepaliveLoop, this);
+}
+
+void SoapyKA9Q::stopKeepalive()
+{
+    {
+        std::lock_guard<std::mutex> lock(keepaliveMutex_);
+        keepaliveStop_ = true;
+    }
+    keepaliveCondition_.notify_all();
+    if (keepaliveThread_.joinable()) keepaliveThread_.join();
+}
+
 SoapySDR::Stream *SoapyKA9Q::setupStream(int direction, const std::string &format,
     const std::vector<size_t> &channels, const SoapySDR::Kwargs &)
 {
@@ -634,6 +706,8 @@ void SoapyKA9Q::closeStream(SoapySDR::Stream *opaque)
     std::lock_guard<std::mutex> lock(mutex_);
     auto *stream = reinterpret_cast<KA9QStream *>(opaque);
     if (stream == nullptr || stream != stream_) return;
+    stream->active = false;
+    stopKeepalive();
     if (ownsChannel_) {
         configure(true);
         ownsChannel_ = false;
@@ -671,6 +745,7 @@ int SoapyKA9Q::activateStream(SoapySDR::Stream *opaque, int flags,
     stream->pending.clear();
     stream->pendingOffset = 0;
     stream->haveRtpState = false;
+    startKeepalive();
     return 0;
 }
 
@@ -681,6 +756,7 @@ int SoapyKA9Q::deactivateStream(SoapySDR::Stream *opaque, int flags, long long)
     auto *stream = reinterpret_cast<KA9QStream *>(opaque);
     if (stream == nullptr || stream != stream_) return SOAPY_SDR_STREAM_ERROR;
     stream->active = false;
+    stopKeepalive();
     stream->dataSocket = Socket();
     if (ownsChannel_) {
         try {
