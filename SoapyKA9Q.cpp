@@ -37,6 +37,13 @@ constexpr uint8_t KA9Q_STATUS = 0;
 constexpr uint8_t KA9Q_COMMAND = 1;
 constexpr uint8_t RTP_VERSION = 2;
 
+static double fullNyquistBandwidth(double sampleRate)
+{
+    // LOW_EDGE and HIGH_EDGE are encoded as floats.  Move each edge one
+    // float representable value inside +/-Fs/2, then recover total width.
+    return 2.0 * double(std::nextafter(float(sampleRate / 2.0), 0.0f));
+}
+
 // Wire-stable values from ka9q-radio src/status.h. Keep this list in order.
 enum StatusType : uint8_t {
     EOL = 0, COMMAND_TAG, CMD_CNT, GPS_TIME, DESCRIPTION,
@@ -153,6 +160,15 @@ static bool isMulticast(const in_addr &addr)
     return IN_MULTICAST(ntohl(addr.s_addr));
 }
 
+static std::string endpointText(const Endpoint &ep)
+{
+    char address[INET_ADDRSTRLEN]{};
+    const char *rendered = ::inet_ntop(AF_INET, &ep.addr.sin_addr,
+                                       address, sizeof(address));
+    return std::string(rendered == nullptr ? "<invalid-address>" : rendered) +
+        ":" + std::to_string(ntohs(ep.addr.sin_port));
+}
+
 static Socket multicastListener(const Endpoint &ep)
 {
     Socket sock(::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
@@ -235,11 +251,6 @@ static void putDouble(std::vector<uint8_t> &out, StatusType type, double value)
     putTlv(out, type, &bits, sizeof(bits));
 }
 
-static void putString(std::vector<uint8_t> &out, StatusType type, const std::string &value)
-{
-    putTlv(out, type, value.data(), value.size());
-}
-
 static uint64_t getUnsigned(const uint8_t *p, size_t length)
 {
     uint64_t value = 0;
@@ -280,11 +291,17 @@ struct Status {
     double sampleRate = 0;
     double lowEdge = 0;
     double highEdge = 0;
+    double firstLoFrequency = 0;
+    double feLowEdge = 0;
+    double feHighEdge = 0;
     unsigned channels = 0;
     unsigned encoding = NO_ENCODING;
     unsigned payloadType = 0;
     Endpoint data;
     bool hasData = false;
+    bool hasFirstLoFrequency = false;
+    bool hasFeLowEdge = false;
+    bool hasFeHighEdge = false;
 };
 
 static bool nextTlv(const uint8_t *&p, const uint8_t *end,
@@ -321,9 +338,21 @@ static bool parseStatus(const uint8_t *packet, size_t length, Status &s)
         case COMMAND_TAG: s.tag = getUnsigned(value, n); break;
         case OUTPUT_SSRC: s.ssrc = static_cast<uint32_t>(getUnsigned(value, n)); break;
         case RADIO_FREQUENCY: s.frequency = getDouble(value, n); break;
+        case FIRST_LO_FREQUENCY:
+            s.firstLoFrequency = getDouble(value, n);
+            s.hasFirstLoFrequency = true;
+            break;
         case OUTPUT_SAMPRATE: s.sampleRate = getUnsigned(value, n); break;
         case LOW_EDGE: s.lowEdge = getFloat(value, n); break;
         case HIGH_EDGE: s.highEdge = getFloat(value, n); break;
+        case FE_LOW_EDGE:
+            s.feLowEdge = getFloat(value, n);
+            s.hasFeLowEdge = true;
+            break;
+        case FE_HIGH_EDGE:
+            s.feHighEdge = getFloat(value, n);
+            s.hasFeHighEdge = true;
+            break;
         case OUTPUT_CHANNELS: s.channels = getUnsigned(value, n); break;
         case OUTPUT_ENCODING: s.encoding = getUnsigned(value, n); break;
         case RTP_PT: s.payloadType = getUnsigned(value, n); break;
@@ -394,21 +423,19 @@ public:
     double getFrequency(int direction, size_t channel,
                         const std::string &name) const override;
     std::vector<std::string> listFrequencies(int, size_t) const override { return {"RF"}; }
-    SoapySDR::RangeList getFrequencyRange(int, size_t) const override {
-        return {SoapySDR::Range(0, 6e9)};
-    }
+    SoapySDR::RangeList getFrequencyRange(int direction, size_t channel) const override;
     SoapySDR::RangeList getFrequencyRange(int direction, size_t channel,
         const std::string &name) const override;
     void setSampleRate(int direction, size_t channel, double rate) override;
     double getSampleRate(int, size_t) const override { return sampleRate_; }
     std::vector<double> listSampleRates(int direction, size_t channel) const override;
     SoapySDR::RangeList getSampleRateRange(int, size_t) const override {
-        return {SoapySDR::Range(8000, 1000000)};
+        return {SoapySDR::Range(8000, 1000000, 400)};
     }
     void setBandwidth(int direction, size_t channel, double bw) override;
     double getBandwidth(int, size_t) const override { return bandwidth_; }
     SoapySDR::RangeList getBandwidthRange(int, size_t) const override {
-        return {SoapySDR::Range(100, sampleRate_)};
+        return {SoapySDR::Range(100, fullNyquistBandwidth(sampleRate_))};
     }
 
 private:
@@ -422,9 +449,12 @@ private:
     Endpoint control_;
     Socket statusSocket_;
     Socket commandSocket_;
-    double frequency_ = 145000000;
+    double frequency_ = 0;
+    double rfLowEdge_ = 0;
+    double rfHighEdge_ = 0;
     double sampleRate_ = 24000;
-    double bandwidth_ = 12000;
+    double bandwidth_ = fullNyquistBandwidth(24000.0);
+    bool bandwidthExplicit_ = false;
     KA9QStream *stream_ = nullptr;
     bool ownsChannel_ = false;
     mutable std::mutex mutex_;
@@ -441,12 +471,29 @@ SoapyKA9Q::SoapyKA9Q(const SoapySDR::Kwargs &args)
     else ssrc_ = randomSsrc();
     if ((it = args.find("frequency")) != args.end()) frequency_ = std::stod(it->second);
     if ((it = args.find("rate")) != args.end()) sampleRate_ = std::stod(it->second);
-    if ((it = args.find("bandwidth")) != args.end()) bandwidth_ = std::stod(it->second);
+    if ((it = args.find("bandwidth")) != args.end()) {
+        bandwidth_ = std::stod(it->second);
+        bandwidthExplicit_ = true;
+    } else {
+        bandwidth_ = fullNyquistBandwidth(sampleRate_);
+    }
 
     control_ = resolveEndpoint(radioName_, KA9Q_STATUS_PORT, iface_);
     iface_ = control_.iface;
     statusSocket_ = multicastListener(control_);
     commandSocket_ = commandSocket(control_);
+    SoapySDR::logf(SOAPY_SDR_INFO,
+        "KA9Q radio=%s control=%s interface=%s",
+        radioName_.c_str(), endpointText(control_).c_str(),
+        iface_.empty() ? "<default-route>" : iface_.c_str());
+
+    // A short-lived idle channel obtains the current front-end tuning limits
+    // without asking radiod to move the shared tuner or emit sample data.
+    // This capability probe is deliberately separate from stream lifetime.
+    configure();
+    ownsChannel_ = true;
+    configure(true);
+    ownsChannel_ = false;
 }
 
 SoapyKA9Q::~SoapyKA9Q()
@@ -473,6 +520,10 @@ void SoapyKA9Q::requireRx(int direction, size_t channel) const
 
 std::vector<std::string> SoapyKA9Q::listAntennas(int direction, size_t channel) const
 {
+    // CubicSDR queries TX channel 0 even when getNumChannels(TX) is zero.
+    // Be permissive for capability discovery so an invalid TX query does not
+    // escape its GUI event handler and terminate the application.
+    if (direction == SOAPY_SDR_TX) return {};
     requireRx(direction, channel);
     return {"RX"};
 }
@@ -499,14 +550,17 @@ Status SoapyKA9Q::configure(bool destroy)
     putUnsigned(command, OUTPUT_SSRC, ssrc_);
     putUnsigned(command, LIFETIME, destroy ? 1 : 0);
     if (!destroy) {
-        putString(command, PRESET, "iq");
         putDouble(command, RADIO_FREQUENCY, frequency_);
+        // radiod validates sample rate against the channel's current
+        // encoding, so select uncompressed floating-point IQ first.  A new
+        // channel may otherwise inherit an Opus default that rejects rates
+        // outside the Opus-supported set.
+        putUnsigned(command, OUTPUT_ENCODING, F32LE);
+        putUnsigned(command, OUTPUT_CHANNELS, 2);
         putUnsigned(command, OUTPUT_SAMPRATE, std::llround(sampleRate_));
         putFloat(command, LOW_EDGE, float(-bandwidth_ / 2));
         putFloat(command, HIGH_EDGE, float(bandwidth_ / 2));
         putUnsigned(command, DEMOD_TYPE, 0);
-        putUnsigned(command, OUTPUT_CHANNELS, 2);
-        putUnsigned(command, OUTPUT_ENCODING, F32LE);
         putUnsigned(command, ENVELOPE, 0);
         putUnsigned(command, PLL_ENABLE, 0);
         putUnsigned(command, AGC_ENABLE, 0);
@@ -514,11 +568,22 @@ Status SoapyKA9Q::configure(bool destroy)
     }
     command.push_back(EOL);
 
+    if (!destroy) {
+        SoapySDR::logf(SOAPY_SDR_INFO,
+            "KA9Q command frequency=%.0f rate=%.0f bandwidth=%.0f",
+            frequency_, sampleRate_, bandwidth_);
+    }
+
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
     do {
         const ssize_t sent = ::sendto(commandSocket_.fd, command.data(), command.size(), 0,
             reinterpret_cast<const sockaddr *>(&control_.addr), sizeof(control_.addr));
-        if (sent != ssize_t(command.size())) throw std::runtime_error("radiod command send failed: " + std::string(strerror(errno)));
+        if (sent != ssize_t(command.size())) {
+            const int error = errno;
+            throw std::runtime_error("radiod command send to " + endpointText(control_) +
+                " via " + (iface_.empty() ? std::string("default route") : iface_) +
+                " failed: " + std::string(strerror(error)));
+        }
         if (destroy) return {};
 
         const auto resendUntil = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
@@ -536,6 +601,13 @@ Status SoapyKA9Q::configure(bool destroy)
                 frequency_ = status.frequency;
                 sampleRate_ = status.sampleRate;
                 bandwidth_ = status.highEdge - status.lowEdge;
+                if (!status.hasFirstLoFrequency || !status.hasFeLowEdge ||
+                    !status.hasFeHighEdge)
+                    throw std::runtime_error("radiod status lacks front-end tuning limits");
+                const double edge1 = status.firstLoFrequency + status.feLowEdge;
+                const double edge2 = status.firstLoFrequency + status.feHighEdge;
+                rfLowEdge_ = std::min(edge1, edge2);
+                rfHighEdge_ = std::max(edge1, edge2);
                 status.data.iface = iface_;
                 return status;
             }
@@ -552,17 +624,7 @@ SoapySDR::Stream *SoapyKA9Q::setupStream(int direction, const std::string &forma
     if (channels.size() > 1 || format != SOAPY_SDR_CF32)
         throw std::runtime_error("SoapyKA9Q supports one CF32 RX stream only");
     if (stream_ != nullptr) throw std::runtime_error("SoapyKA9Q stream already open");
-    Status status = configure();
-    ownsChannel_ = true;
     auto *stream = new KA9QStream;
-    stream->payloadType = status.payloadType;
-    try { stream->dataSocket = multicastListener(status.data); }
-    catch (...) {
-        delete stream;
-        try { configure(true); } catch (...) {}
-        ownsChannel_ = false;
-        throw;
-    }
     stream_ = stream;
     return reinterpret_cast<SoapySDR::Stream *>(stream);
 }
@@ -572,20 +634,39 @@ void SoapyKA9Q::closeStream(SoapySDR::Stream *opaque)
     std::lock_guard<std::mutex> lock(mutex_);
     auto *stream = reinterpret_cast<KA9QStream *>(opaque);
     if (stream == nullptr || stream != stream_) return;
-    stream_ = nullptr;
-    delete stream;
     if (ownsChannel_) {
         configure(true);
         ownsChannel_ = false;
     }
+    stream_ = nullptr;
+    delete stream;
 }
 
 int SoapyKA9Q::activateStream(SoapySDR::Stream *opaque, int flags,
                               long long, size_t)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
     auto *stream = reinterpret_cast<KA9QStream *>(opaque);
     if (stream == nullptr || stream != stream_) return SOAPY_SDR_STREAM_ERROR;
+    if (stream->active) return 0;
+    SoapySDR::logf(SOAPY_SDR_INFO,
+        "KA9Q activate frequency=%.0f rate=%.0f bandwidth=%.0f",
+        frequency_, sampleRate_, bandwidth_);
+    try {
+        Status status = configure();
+        ownsChannel_ = true;
+        stream->dataSocket = multicastListener(status.data);
+        stream->payloadType = status.payloadType;
+    } catch (const std::exception &error) {
+        if (ownsChannel_) {
+            try { configure(true); } catch (...) {}
+            ownsChannel_ = false;
+        }
+        SoapySDR::logf(SOAPY_SDR_ERROR,
+            "KA9Q stream activation failed: %s", error.what());
+        return SOAPY_SDR_STREAM_ERROR;
+    }
     stream->active = true;
     stream->pending.clear();
     stream->pendingOffset = 0;
@@ -595,10 +676,23 @@ int SoapyKA9Q::activateStream(SoapySDR::Stream *opaque, int flags,
 
 int SoapyKA9Q::deactivateStream(SoapySDR::Stream *opaque, int flags, long long)
 {
+    std::lock_guard<std::mutex> lock(mutex_);
     if (flags != 0) return SOAPY_SDR_NOT_SUPPORTED;
     auto *stream = reinterpret_cast<KA9QStream *>(opaque);
     if (stream == nullptr || stream != stream_) return SOAPY_SDR_STREAM_ERROR;
     stream->active = false;
+    stream->dataSocket = Socket();
+    if (ownsChannel_) {
+        try {
+            configure(true);
+        } catch (const std::exception &error) {
+            SoapySDR::logf(SOAPY_SDR_WARNING,
+                "KA9Q channel deletion failed: %s", error.what());
+            ownsChannel_ = false;
+            return SOAPY_SDR_STREAM_ERROR;
+        }
+        ownsChannel_ = false;
+    }
     return 0;
 }
 
@@ -714,9 +808,20 @@ void SoapyKA9Q::setFrequency(int direction, size_t channel, double frequency,
                              const SoapySDR::Kwargs &)
 {
     requireRx(direction, channel);
-    if (!std::isfinite(frequency) || frequency < 0) throw std::runtime_error("invalid frequency");
-    frequency_ = frequency;
-    if (stream_ != nullptr) configure();
+    if (!std::isfinite(frequency) || frequency < 0)
+        throw std::runtime_error("invalid frequency");
+    if (frequency != 0 &&
+        (frequency < rfLowEdge_ || frequency > rfHighEdge_)) {
+        const double applied = std::min(std::max(frequency, rfLowEdge_), rfHighEdge_);
+        SoapySDR::logf(SOAPY_SDR_WARNING,
+            "KA9Q requested frequency %.0f Hz is outside current passband "
+            "%.0f..%.0f Hz; using %.0f Hz",
+            frequency, rfLowEdge_, rfHighEdge_, applied);
+        frequency_ = applied;
+    } else {
+        frequency_ = frequency;
+    }
+    if (stream_ != nullptr && stream_->active) configure();
 }
 
 void SoapyKA9Q::setFrequency(int direction, size_t channel,
@@ -738,20 +843,35 @@ double SoapyKA9Q::getFrequency(int direction, size_t channel,
 }
 
 SoapySDR::RangeList SoapyKA9Q::getFrequencyRange(
+    int direction, size_t channel) const
+{
+    requireRx(direction, channel);
+    return {SoapySDR::Range(rfLowEdge_, rfHighEdge_)};
+}
+
+SoapySDR::RangeList SoapyKA9Q::getFrequencyRange(
     int direction, size_t channel, const std::string &name) const
 {
     requireRx(direction, channel);
     if (name != "RF") return {};
-    return {SoapySDR::Range(0, 6e9)};
+    return {SoapySDR::Range(rfLowEdge_, rfHighEdge_)};
 }
 
 void SoapyKA9Q::setSampleRate(int direction, size_t channel, double rate)
 {
     requireRx(direction, channel);
-    if (!std::isfinite(rate) || rate < 1) throw std::runtime_error("invalid sample rate");
+    const long long integerRate = std::llround(rate);
+    if (!std::isfinite(rate) || rate < 1 ||
+        std::fabs(rate - double(integerRate)) > 0.001 ||
+        integerRate % 400 != 0)
+        throw std::runtime_error("sample rate must be an integer multiple of 400 Hz");
+    SoapySDR::logf(SOAPY_SDR_INFO,
+        "KA9Q setSampleRate requested=%.0f active=%s",
+        rate, stream_ != nullptr && stream_->active ? "yes" : "no");
     sampleRate_ = rate;
-    if (bandwidth_ > rate) bandwidth_ = rate;
-    if (stream_ != nullptr) configure();
+    if (!bandwidthExplicit_ || bandwidth_ >= rate)
+        bandwidth_ = fullNyquistBandwidth(rate);
+    if (stream_ != nullptr && stream_->active) configure();
 }
 
 std::vector<double> SoapyKA9Q::listSampleRates(int direction, size_t channel) const
@@ -764,9 +884,11 @@ std::vector<double> SoapyKA9Q::listSampleRates(int direction, size_t channel) co
 void SoapyKA9Q::setBandwidth(int direction, size_t channel, double bw)
 {
     requireRx(direction, channel);
-    if (!std::isfinite(bw) || bw <= 0 || bw > sampleRate_) throw std::runtime_error("invalid bandwidth");
+    if (!std::isfinite(bw) || bw <= 0 || bw >= sampleRate_)
+        throw std::runtime_error("bandwidth must be greater than zero and less than the sample rate");
     bandwidth_ = bw;
-    if (stream_ != nullptr) configure();
+    bandwidthExplicit_ = true;
+    if (stream_ != nullptr && stream_->active) configure();
 }
 
 static SoapySDR::KwargsList findKA9Q(const SoapySDR::Kwargs &args)
